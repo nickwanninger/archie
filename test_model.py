@@ -12,7 +12,6 @@ import torch.nn.functional as F  # Added as per instruction
 from mistral_model import (
     MistralLite,
     ModelArgs,
-    CHECKPOINT_PATH,
     get_tokenizer,
     MODEL_ARGS,
 )
@@ -48,9 +47,7 @@ def prob_to_style(prob):
 
 
 console.print("[bold yellow]Loading model...[/]")
-model, tokenizer = mistral_inference.load_model_from_checkpoint(
-    checkpoint_path=mistral_inference.CHECKPOINT_PATH, device="cuda"
-)
+model, tokenizer = mistral_inference.load_model_from_checkpoint(device="cuda")
 console.print("[bold green]Model loaded![/]")
 
 
@@ -85,7 +82,7 @@ while True:
             vertical_overflow="visible",
         ):
             for chunk in mistral_inference.stream_text(
-                model, tokenizer, prompt, steps=steps, temperature=0.8
+                model, tokenizer, prompt, steps=steps, temperature=1
             ):
                 token = chunk["text"]
                 prob = chunk["prob"]

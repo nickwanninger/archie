@@ -99,7 +99,7 @@ class PerplexityApp(App):
             # mm.load_model_from_checkpoint prints to console.
 
             model, tokenizer = mm.load_model_from_checkpoint(
-                checkpoint_path=mm.CHECKPOINT_PATH, device=self.device
+                checkpoint_path=None, device=self.device
             )
             model.eval()
             self.model = model
