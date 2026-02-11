@@ -1,4 +1,7 @@
 .venv
 model/
+models/
 .envrc
 __pycache__
+
+old/

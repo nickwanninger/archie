@@ -33,29 +33,30 @@ class TextDataset(IterableDataset):
         self.eot = tokenizer._special_tokens.get("<|endoftext|>", config.vocab_size - 1)
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            # When using multiple workers, we need to shard the dataset
-            ds = self.dataset.shard(
-                num_shards=worker_info.num_workers, index=worker_info.id
-            )
-        else:
-            ds = self.dataset
+        # Buffer to accumulate tokens across documents
+        token_buffer = []
 
-        buffer = []
-        chunk_size = self.config.block_size + 1
+        # Iterate through the dataset
+        for example in self.dataset:
+            # Assuming your dataset has a 'text' field
+            # Adjust the field name based on your dataset
+            text = example["text"]
 
-        for entry in ds:
-            text = entry["text"]
-            text = text.replace("’", "'").replace("“", '"').replace("”", '"')
-            tokens = self.tokenizer.encode_ordinary(text)
-            tokens.append(self.eot)
-            buffer.extend(tokens)
+            # Tokenize
+            tokens = self.tokenizer.encode(text)
 
-            while len(buffer) >= chunk_size:
-                chunk = buffer[:chunk_size]
-                buffer = buffer[self.config.block_size :]  # Sliding by block_size
+            # Add tokens to buffer with EOT separator
+            token_buffer.extend(tokens)
+            token_buffer.append(self.eot)
 
+            # Yield chunks of max_seq_len + 1 (for input and target)
+            while len(token_buffer) >= self.config.max_seq_len + 1:
+                # Extract chunk
+                chunk = token_buffer[: self.config.max_seq_len + 1]
+                token_buffer = token_buffer[self.config.max_seq_len + 1 :]
+
+                # Split into input (x) and target (y)
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
+
                 yield x, y
