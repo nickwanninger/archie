@@ -19,7 +19,7 @@ from rich.logging import RichHandler
 import jsonlines
 
 
-config = archie.config.glow
+config = archie.config.glimmer
 
 checkpoint_dir = config.get_checkpoint_dir()
 model_path = checkpoint_dir / "model.pt"
@@ -53,11 +53,20 @@ def enable_gradient_checkpointing(model):
 
 
 # Learning rate scheduler (cosine with warmup)
-def get_lr(step, warmup_steps=100, max_steps=100000):  # Changed from 2000 to 100
+# def get_lr(step, warmup_steps=100, max_steps=100000):  # Changed from 2000 to 100
+#     if step < warmup_steps:
+#         return 3e-4 * step / warmup_steps
+#     progress = (step - warmup_steps) / (max_steps - warmup_steps)
+#     return 3e-4 * 0.5 * (1 + math.cos(progress * math.pi))
+
+
+# Start cosine decay now instead of waiting
+def get_lr(step, warmup_steps=100, max_steps=20000, max_lr=3e-4, min_lr=3e-5):
     if step < warmup_steps:
-        return 3e-4 * step / warmup_steps
+        return max_lr * step / warmup_steps
+    # Cosine decay
     progress = (step - warmup_steps) / (max_steps - warmup_steps)
-    return 3e-4 * 0.5 * (1 + math.cos(progress * math.pi))
+    return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 @torch.no_grad()
@@ -108,9 +117,6 @@ optimizer = torch.optim.AdamW(
 global_step = 0
 tokens_seen = 0
 
-batch_size = 6
-accumulation_steps = 8  # batch_size=4 → effective batch_size=32
-
 
 # Load the model
 if model_path.exists():
@@ -125,6 +131,15 @@ if model_path.exists():
     log.info("Done.")
 else:
     log.info("Model not found, starting from scratch.")
+
+
+desired_batch_size = 128
+batch_size = 12  # maximum supported by my A30X for training.
+accumulation_steps = desired_batch_size // batch_size
+
+log.info(f"Batch size: {batch_size}")
+log.info(f"Accumulation steps: {accumulation_steps}")
+log.info(f"Effective batch size: {batch_size * accumulation_steps}")
 
 
 dataset = archie.training.get_datasets()
@@ -151,13 +166,13 @@ def append_log_entry(data):
 log.info("Starting training...")
 
 
-@torch.compile
-def train_step(x, y):
-    logits, loss = model(x, labels=y)
-    loss = loss / accumulation_steps
-    loss.backward()
-    return loss
+# def train_step(x, y):
+#     logits, loss = model(x, labels=y)
+#     loss = loss / accumulation_steps
+#     loss.backward()
+#     return loss
 
+opt_model = model  # torch.compile(model)
 
 for i, (x, y) in enumerate(train_loader):
     x = x.to(config.device)
@@ -167,10 +182,10 @@ for i, (x, y) in enumerate(train_loader):
     tokens_seen += x.numel()
 
     # Forward + backward
-    # logits, loss = model_opt(x, labels=y)
-    # loss = loss / accumulation_steps
-    # loss.backward()
-    loss = train_step(x, y)
+    logits, loss = opt_model(x, labels=y)
+    loss = loss / accumulation_steps
+    loss.backward()
+    # loss = train_step(x, y)
 
     # Update weights every accumulation_steps
     if (i + 1) % accumulation_steps == 0:
@@ -182,8 +197,9 @@ for i, (x, y) in enumerate(train_loader):
         # Optimizer step
         optimizer.step()
 
-        lr = get_lr(global_step)
+        # lr = get_lr(global_step)
         # lr = 1e-4
+        lr = 1.5e-4
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -209,10 +225,19 @@ for i, (x, y) in enumerate(train_loader):
                     "loss": effective_loss,
                     "lr": lr,
                     "datetime": datetime.utcnow().isoformat(),
+                    "batch_size": batch_size,
+                    "acc_steps": accumulation_steps,
                 }
             )
 
-        if global_step % 250 == 0:
+        if global_step % 100 == 0:
+            log.info("Generating samples...")
+            prompts = ["The", "In the", "Scientists have", "Once upon a time"]
+            for prompt in prompts:
+                generated = generate_text(
+                    model, tokenizer, prompt=prompt, max_tokens=50
+                )
+                log.info(f"  '{prompt}' → {generated}")
             log.info("Saving model...")
             torch.save(
                 {

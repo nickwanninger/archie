@@ -27,21 +27,21 @@ class Config:
         return Path("models") / Path(self.name)
 
 
-# Smaller 500M model.
+# Smaller model.
 flicker = Config(
     name="flicker",
     d_model=1024,
-    n_layers=16,
-    n_heads=8,
+    n_layers=24,
+    n_heads=24,
     n_kv_heads=4,
-    d_ff=2816,
-    max_seq_len=2048,
+    d_ff=6144,
+    max_seq_len=1024,
     dropout=0.0,
 )
 
 # Medium 1.2b config.
-glow = Config(
-    name="glow",
+glimmer = Config(
+    name="glimmer",
     d_model=2048,
     n_layers=24,
     n_heads=16,
