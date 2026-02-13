@@ -91,8 +91,12 @@ class GroupedQueryAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
+        # Expand KV heads to match Q heads for SDPA
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=2)
+            v = v.repeat_interleave(self.n_rep, dim=2)
+
         # Transpose for attention: (batch, n_heads, seq_len, head_dim)
-        # K/V stay at n_kv_heads — SDPA handles GQA natively (PyTorch >= 2.2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
