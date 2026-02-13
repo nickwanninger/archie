@@ -176,7 +176,12 @@ log.info("Starting training...")
 
 opt_model = torch.compile(model, mode="reduce-overhead")
 
+running_loss = 0.0
 for i, (x, y) in enumerate(train_loader):
+    # Required when using CUDAGraphs (reduce-overhead) to prevent output
+    # tensors from being overwritten before they are read.
+    torch.compiler.cudagraph_mark_step_begin()
+
     x = x.to(config.device)
     y = y.to(config.device)
 
@@ -186,8 +191,8 @@ for i, (x, y) in enumerate(train_loader):
     # Forward + backward
     logits, loss = opt_model(x, labels=y)
     loss = loss / accumulation_steps
+    running_loss += loss.item()
     loss.backward()
-    # loss = train_step(x, y)
 
     # Update weights every accumulation_steps
     if (i + 1) % accumulation_steps == 0:
@@ -200,14 +205,13 @@ for i, (x, y) in enumerate(train_loader):
         optimizer.step()
 
         lr = get_lr(global_step)
-        # lr = 1e-4
-        # lr = 1.5e-4
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
         optimizer.zero_grad()
 
-        effective_loss = loss.item() * accumulation_steps
+        effective_loss = running_loss
+        running_loss = 0.0
 
         # Logging
         perplexity = math.exp(effective_loss)
