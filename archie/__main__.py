@@ -111,7 +111,7 @@ torchinfo.summary(model)
 tokenizer = archie.get_tokenizer()
 
 optimizer = torch.optim.AdamW(
-    model.parameters(), lr=2e-4, betas=(0.9, 0.999), weight_decay=0.1
+    model.parameters(), lr=2e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=config.device == 'cuda'
 )
 
 global_step = 0
@@ -133,7 +133,8 @@ else:
     log.info("Model not found, starting from scratch.")
 
 
-desired_batch_size = 128
+desired_tokens_per_batch = 0.5e6 # .5 million, as was in the GPT-3 paper
+desired_batch_size = desired_tokens_per_batch // config.max_seq_len
 batch_size = 12  # maximum supported by my A30X for training.
 accumulation_steps = desired_batch_size // batch_size
 
@@ -192,14 +193,14 @@ for i, (x, y) in enumerate(train_loader):
         global_step += 1
 
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         # Optimizer step
         optimizer.step()
 
-        # lr = get_lr(global_step)
+        lr = get_lr(global_step)
         # lr = 1e-4
-        lr = 1.5e-4
+        # lr = 1.5e-4
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -212,23 +213,23 @@ for i, (x, y) in enumerate(train_loader):
         tokens_M = tokens_seen / 1_000_000
         tokens_per_param = tokens_seen / total_params
         log.info(
-            f"Step {global_step} | Tokens: {tokens_M:.2f}M ({tokens_per_param:.3f}/param) | PPL: {perplexity:9.2f} | loss: {effective_loss:.2f} | LR: {lr:.2e}"
+            f"Step {global_step} | Tokens: {tokens_M:.2f}M ({tokens_per_param:.3f}/param) | PPL: {perplexity:9.2f} | loss: {effective_loss:.2f} | norm: {norm:.4f} | LR: {lr:.2e}"
         )
 
-        if global_step % 10 == 0:
-            append_log_entry(
-                {
-                    "step": global_step,
-                    "tokens_seen": tokens_seen,
-                    "tokens_per_param": tokens_per_param,
-                    "perplexity": perplexity,
-                    "loss": effective_loss,
-                    "lr": lr,
-                    "datetime": datetime.utcnow().isoformat(),
-                    "batch_size": batch_size,
-                    "acc_steps": accumulation_steps,
-                }
-            )
+        append_log_entry(
+            {
+                "step": global_step,
+                "tokens_seen": tokens_seen,
+                "tokens_per_param": tokens_per_param,
+                "perplexity": perplexity,
+                "loss": effective_loss,
+                "norm": norm,
+                "lr": lr,
+                "datetime": datetime.utcnow().isoformat(),
+                "batch_size": batch_size,
+                "acc_steps": accumulation_steps,
+            }
+        )
 
         if global_step % 100 == 0:
             log.info("Generating samples...")
