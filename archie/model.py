@@ -78,7 +78,7 @@ class GroupedQueryAttention(nn.Module):
 
         self.rotary_emb = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         batch, seq_len, _ = x.shape
 
         # Project and reshape
@@ -91,23 +91,16 @@ class GroupedQueryAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Repeat KV heads for GQA
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=2)
-            v = v.repeat_interleave(self.n_rep, dim=2)
-
         # Transpose for attention: (batch, n_heads, seq_len, head_dim)
+        # K/V stay at n_kv_heads — SDPA handles GQA natively (PyTorch >= 2.2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Use Flash Attention here (or scaled_dot_product_attention)
-        # For PyTorch 2.0+:
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=mask,
             is_causal=True,
             dropout_p=0.0 if not self.training else 0.1,
         )
@@ -137,9 +130,9 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(config.d_model)
         self.ffn_norm = RMSNorm(config.d_model)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         # Pre-norm architecture
-        x = x + self.attn(self.attn_norm(x), mask)
+        x = x + self.attn(self.attn_norm(x))
         x = x + self.ffn(self.ffn_norm(x))
         return x
 

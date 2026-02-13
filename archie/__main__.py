@@ -148,9 +148,10 @@ text_dataset = archie.training.TextDataset(dataset, tokenizer, config)
 train_loader = DataLoader(
     text_dataset,
     batch_size=batch_size,
-    num_workers=0,
-    # prefetch_factor=64,  # Prefetch
-    pin_memory=True,  # Optimization
+    num_workers=4,
+    prefetch_factor=4,
+    pin_memory=True,
+    persistent_workers=True,
 )
 
 
@@ -173,7 +174,7 @@ log.info("Starting training...")
 #     loss.backward()
 #     return loss
 
-opt_model = model  # torch.compile(model)
+opt_model = torch.compile(model, mode="reduce-overhead")
 
 for i, (x, y) in enumerate(train_loader):
     x = x.to(config.device)

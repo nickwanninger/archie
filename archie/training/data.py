@@ -33,30 +33,35 @@ class TextDataset(IterableDataset):
         self.eot = tokenizer._special_tokens.get("<|endoftext|>", config.vocab_size - 1)
 
     def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        dataset = self.dataset
+        if worker_info is not None:
+            dataset = dataset.shard(
+                num_shards=worker_info.num_workers,
+                index=worker_info.id,
+            )
+
         # Buffer to accumulate tokens across documents
         token_buffer = []
+        offset = 0
+        chunk_size = self.config.max_seq_len + 1
+        trim_every = 100_000  # amortize the list copy cost
 
-        # Iterate through the dataset
-        for example in self.dataset:
-            # Assuming your dataset has a 'text' field
-            # Adjust the field name based on your dataset
+        for example in dataset:
             text = example["text"]
-
-            # Tokenize
             tokens = self.tokenizer.encode(text)
-
-            # Add tokens to buffer with EOT separator
             token_buffer.extend(tokens)
             token_buffer.append(self.eot)
 
-            # Yield chunks of max_seq_len + 1 (for input and target)
-            while len(token_buffer) >= self.config.max_seq_len + 1:
-                # Extract chunk
-                chunk = token_buffer[: self.config.max_seq_len + 1]
-                token_buffer = token_buffer[self.config.max_seq_len + 1 :]
+            while len(token_buffer) - offset >= chunk_size:
+                chunk = token_buffer[offset : offset + chunk_size]
+                offset += chunk_size
 
-                # Split into input (x) and target (y)
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
-
                 yield x, y
+
+                # Periodically trim consumed tokens to keep buffer from growing unbounded
+                if offset >= trim_every:
+                    token_buffer = token_buffer[offset:]
+                    offset = 0
