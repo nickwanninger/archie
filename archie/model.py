@@ -24,12 +24,12 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
-        # Precompute for max sequence length
+        # Precompute for max sequence length (non-persistent: deterministic, not learned)
         t = torch.arange(max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos())
-        self.register_buffer("sin_cached", emb.sin())
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self, x, seq_len):
         # x: (batch, seq_len, n_heads, head_dim)
@@ -64,7 +64,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads):
+    def __init__(self, d_model, n_heads, n_kv_heads, max_seq_len):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
@@ -76,7 +76,7 @@ class GroupedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
 
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.rotary_emb = RotaryEmbedding(self.head_dim, max_seq_len=max_seq_len)
 
     def forward(self, x):
         batch, seq_len, _ = x.shape
@@ -128,7 +128,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = GroupedQueryAttention(
-            config.d_model, config.n_heads, config.n_kv_heads
+            config.d_model, config.n_heads, config.n_kv_heads, config.max_seq_len
         )
         self.ffn = SwiGLU(config.d_model, config.d_ff)
         self.attn_norm = RMSNorm(config.d_model)

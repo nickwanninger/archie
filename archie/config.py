@@ -35,7 +35,8 @@ flicker = Config(
     n_heads=24,
     n_kv_heads=4,
     d_ff=6144,
-    max_seq_len=1024,
+    # max_seq_len=1024,
+    max_seq_len=4096,
     dropout=0.0,
 )
 

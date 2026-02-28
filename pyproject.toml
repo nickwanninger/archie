@@ -25,4 +25,5 @@ dependencies = [
     "nbformat>=5.10.4",
     "jsonlines>=4.0.0",
     "scikit-learn>=1.8.0",
+    "lm-eval>=0.4.0",
 ]
