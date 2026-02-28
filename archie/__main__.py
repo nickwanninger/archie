@@ -32,7 +32,9 @@ def setup_logging(debug_log_path):
     log = logging.getLogger("archie")
     console_handler = RichHandler(level=logging.DEBUG, show_path=False)
     log.addHandler(console_handler)
-    formatter = logging.Formatter("{asctime} [{levelname}] {name}: {message}", style="{")
+    formatter = logging.Formatter(
+        "{asctime} [{levelname}] {name}: {message}", style="{"
+    )
     file_handler = logging.FileHandler(debug_log_path)
     file_handler.setFormatter(formatter)
     log.addHandler(file_handler)
@@ -48,7 +50,7 @@ def enable_gradient_checkpointing(model):
         )
 
 
-def get_lr(step, warmup_steps=100, max_steps=50000, max_lr=3e-4, min_lr=1e-4):
+def get_lr(step, warmup_steps=100, max_steps=30000, max_lr=3e-4, min_lr=1e-4):
     if step < warmup_steps:
         return max_lr * step / warmup_steps
     progress = (step - warmup_steps) / (max_steps - warmup_steps)
@@ -73,7 +75,9 @@ _ANSI_RESET = "\033[0m"
 
 
 @torch.no_grad()
-def stream_tokens(model, tokenizer, prompt, max_tokens=200, temperature=0.8, stop_token=None):
+def stream_tokens(
+    model, tokenizer, prompt, max_tokens=200, temperature=0.8, stop_token=None
+):
     """Yield (fragment, probability) tuples one token at a time."""
     tokens = torch.tensor([tokenizer.encode(prompt)]).to(model.config.device)
 
@@ -95,7 +99,17 @@ def stream_tokens(model, tokenizer, prompt, max_tokens=200, temperature=0.8, sto
 @torch.no_grad()
 def generate_text(model, tokenizer, prompt="The", max_tokens=50, temperature=0.8):
     model.eval()
-    text = prompt + "".join(f for f, _ in stream_tokens(model, tokenizer, prompt, max_tokens, temperature, stop_token=tokenizer.eot_token))
+    text = prompt + "".join(
+        f
+        for f, _ in stream_tokens(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens,
+            temperature,
+            stop_token=tokenizer.eot_token,
+        )
+    )
     model.train()
     return text
 
@@ -184,8 +198,9 @@ def cmd_train(args, config, log):
     log.info(f"Accumulation steps: {accumulation_steps}")
     log.info(f"Effective batch size: {batch_size * accumulation_steps}")
 
+    seen_db_path = checkpoint_dir / "seen.db"
     dataset = archie.training.get_datasets()
-    text_dataset = archie.training.TextDataset(dataset, tokenizer, config)
+    text_dataset = archie.training.TextDataset(dataset, tokenizer, config, db_path=str(seen_db_path))
     train_loader = DataLoader(
         text_dataset,
         batch_size=batch_size,
@@ -241,9 +256,10 @@ def cmd_train(args, config, log):
 
         perplexity = math.exp(effective_loss)
         tokens_M = tokens_seen / 1_000_000
+        tokens_B = tokens_seen / 1_000
         tokens_per_param = tokens_seen / total_params
         log.info(
-            f"Step {global_step} | Tokens: {tokens_M:.2f}M ({tokens_per_param:.3f}/param)"
+            f"Step {global_step} | Tokens: {tokens_B:.4f}B ({tokens_per_param:.3f}/param)"
             f" | PPL: {perplexity:9.2f} | loss: {effective_loss:.2f}"
             f" | norm: {norm:.4f} | LR: {lr:.2e}"
         )
@@ -263,10 +279,12 @@ def cmd_train(args, config, log):
             }
         )
 
-        if global_step % 1000 == 0:
+        if global_step % 500 == 0:
             log.info("Running lm_eval benchmarks...")
             run_lm_eval(
-                model, tokenizer, config,
+                model,
+                tokenizer,
+                config,
                 tasks=["arc_easy", "hellaswag", "lambada_openai", "winogrande"],
                 eval_log_path=eval_log_path,
                 log=log,
@@ -287,7 +305,7 @@ def cmd_train(args, config, log):
             "The python code to reverse a list is:\n```python\ndef reverse_list(l):",
         ]
         for prompt in prompts:
-            generated = generate_text(model, tokenizer, prompt=prompt, max_tokens=1024)
+            generated = generate_text(model, tokenizer, prompt=prompt, max_tokens=100)
             log.info(f"  '{prompt}' → {generated}")
 
         log.info("Saving model...")
@@ -337,17 +355,23 @@ def cmd_validate(args, config, log):
 
             if (i + 1) % 10 == 0:
                 avg = total_loss / count
-                log.info(f"Batch {i + 1}/{num_batches} | Loss: {avg:.4f} | PPL: {math.exp(avg):.2f}")
+                log.info(
+                    f"Batch {i + 1}/{num_batches} | Loss: {avg:.4f} | PPL: {math.exp(avg):.2f}"
+                )
 
     avg_loss = total_loss / count
-    log.info(f"Validation complete | Avg Loss: {avg_loss:.4f} | PPL: {math.exp(avg_loss):.2f}")
+    log.info(
+        f"Validation complete | Avg Loss: {avg_loss:.4f} | PPL: {math.exp(avg_loss):.2f}"
+    )
 
 
 def cmd_test(args, config, log):
     log.info("Loading model for inference...")
     model, tokenizer = load_model_for_inference(config, log)
 
-    print("\nReady. Enter a prompt for next-token prediction. Empty line or Ctrl-C to exit.\n")
+    print(
+        "\nReady. Enter a prompt for next-token prediction. Empty line or Ctrl-C to exit.\n"
+    )
 
     while True:
         try:
@@ -360,8 +384,12 @@ def cmd_test(args, config, log):
             break
 
         print(f"\n{prompt}", end="", flush=True)
-        for fragment, prob in stream_tokens(model, tokenizer, prompt, max_tokens=200, temperature=0.8):
-            print(f"{_prob_to_bg_ansi(prob)}{fragment}{_ANSI_RESET}", end="", flush=True)
+        for fragment, prob in stream_tokens(
+            model, tokenizer, prompt, max_tokens=200, temperature=0.8
+        ):
+            print(
+                f"{_prob_to_bg_ansi(prob)}{fragment}{_ANSI_RESET}", end="", flush=True
+            )
         print("\n")
 
 
@@ -426,7 +454,9 @@ def run_lm_eval(model, tokenizer, config, tasks, eval_log_path, log, step=None):
                 ctx_tokens = ctx_tokens[-max_ctx:]
 
                 input_ids = ctx_tokens + cont_tokens
-                input_tensor = torch.tensor([input_ids], dtype=torch.long, device=self._config.device)
+                input_tensor = torch.tensor(
+                    [input_ids], dtype=torch.long, device=self._config.device
+                )
 
                 logits, _ = self._model(input_tensor)
                 # logits[i] predicts token[i+1], so continuation starts at len(ctx)-1
@@ -434,7 +464,9 @@ def run_lm_eval(model, tokenizer, config, tasks, eval_log_path, log, step=None):
                 cont_logits = logits[0, cont_start : cont_start + len(cont_tokens), :]
 
                 log_probs = F.log_softmax(cont_logits, dim=-1)
-                cont_tensor = torch.tensor(cont_tokens, dtype=torch.long, device=self._config.device)
+                cont_tensor = torch.tensor(
+                    cont_tokens, dtype=torch.long, device=self._config.device
+                )
                 token_log_probs = log_probs[range(len(cont_tokens)), cont_tensor]
                 sum_log_prob = token_log_probs.sum().item()
 
@@ -452,17 +484,23 @@ def run_lm_eval(model, tokenizer, config, tasks, eval_log_path, log, step=None):
                 tokens = [self.eot_token_id] + self._tokenizer.encode(text)
                 tokens = tokens[: self._config.max_seq_len]
 
-                input_tensor = torch.tensor([tokens], dtype=torch.long, device=self._config.device)
+                input_tensor = torch.tensor(
+                    [tokens], dtype=torch.long, device=self._config.device
+                )
                 logits, _ = self._model(input_tensor)
 
                 log_probs = F.log_softmax(logits[0, :-1, :], dim=-1)
-                targets = torch.tensor(tokens[1:], dtype=torch.long, device=self._config.device)
+                targets = torch.tensor(
+                    tokens[1:], dtype=torch.long, device=self._config.device
+                )
                 sum_log_prob = log_probs[range(len(targets)), targets].sum().item()
                 results.append(sum_log_prob)
             return results
 
         def generate_until(self, requests):
-            raise NotImplementedError("generate_until is not supported; use loglikelihood-based tasks")
+            raise NotImplementedError(
+                "generate_until is not supported; use loglikelihood-based tasks"
+            )
 
     was_training = model.training
     model.eval()
@@ -522,7 +560,9 @@ def main():
 
     subparsers.add_parser("train", help="Run the pretraining loop")
 
-    val_parser = subparsers.add_parser("validate", help="Evaluate cross-validation loss")
+    val_parser = subparsers.add_parser(
+        "validate", help="Evaluate cross-validation loss"
+    )
     val_parser.add_argument(
         "--batches",
         type=int,
