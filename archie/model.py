@@ -152,7 +152,7 @@ class Router(nn.Module):
 
         aux_loss = self.num_experts * (f * P).sum()
 
-        return top_k_probs, top_k_indices, aux_loss
+        return top_k_probs, top_k_indices, aux_loss, tokens_per_expert
 
 
 class MoELayer(nn.Module):
@@ -164,7 +164,7 @@ class MoELayer(nn.Module):
 
     def forward(self, x):
         # x: (batch, seq_len, d_model)
-        top_k_probs, top_k_indices, aux_loss = self.router(x)
+        top_k_probs, top_k_indices, aux_loss, tokens_per_expert = self.router(x)
         batch, seq_len, d_model = x.shape
         output = torch.zeros_like(x)
 
@@ -180,7 +180,7 @@ class MoELayer(nn.Module):
                 expert_out = expert(tokens)
                 output[mask] += weights_k[mask].unsqueeze(-1) * expert_out
 
-        return output, aux_loss
+        return output, aux_loss, tokens_per_expert
 
 
 class MoETransformerBlock(nn.Module):
@@ -195,9 +195,9 @@ class MoETransformerBlock(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.attn_norm(x))
-        moe_out, aux_loss = self.moe(self.ffn_norm(x))
+        moe_out, aux_loss, tokens_per_expert = self.moe(self.ffn_norm(x))
         x = x + moe_out
-        return x, aux_loss
+        return x, aux_loss, tokens_per_expert
 
 
 class TransformerBlock(nn.Module):
@@ -291,9 +291,16 @@ class ArchieMoEModel(nn.Module):
         x = self.embed_tokens(input_ids)
 
         total_aux_loss = 0.0
-        for layer in self.layers:
-            x, aux_loss = layer(x)
+        expert_counts = torch.zeros(
+            self.config.n_layers, self.config.num_experts,
+            device=input_ids.device,
+        )
+        for i, layer in enumerate(self.layers):
+            x, aux_loss, tokens_per_expert = layer(x)
             total_aux_loss = total_aux_loss + aux_loss
+            expert_counts[i] = tokens_per_expert
+
+        self._expert_counts = expert_counts
 
         x = self.norm(x)
         logits = self.lm_head(x)

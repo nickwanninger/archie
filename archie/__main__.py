@@ -17,10 +17,9 @@ import math
 
 import logging
 from rich.logging import RichHandler
+from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, SpinnerColumn
 
 import jsonlines
-
-
 
 
 def setup_logging(debug_log_path):
@@ -121,7 +120,6 @@ def load_model_for_training(config, log):
     model_path = checkpoint_dir / "model.pt"
 
     model = archie.create_model(config).to(config.device).to(torch.bfloat16)
-    enable_gradient_checkpointing(model)
     torchinfo.summary(model)
 
     optimizer = torch.optim.AdamW(
@@ -182,6 +180,7 @@ def cmd_train(args, config, log):
     checkpoint_dir = config.get_checkpoint_dir()
     model_path = checkpoint_dir / "model.pt"
     training_log_path = checkpoint_dir / "training.jsonl"
+    expert_usage_path = checkpoint_dir / "expert_usage.jsonl"
     eval_log_path = checkpoint_dir / "evaluation.jsonl"
 
     log.info("Allocating model...")
@@ -199,12 +198,10 @@ def cmd_train(args, config, log):
     all_on_gpu = all(p.device.type == "cuda" for p in model.parameters())
     log.info(f"Fully on GPU: {all_on_gpu}")
     for name, buf in model.named_buffers():
-      if buf.device.type != "cuda":
-          print(f"Buffer on CPU: {name} on {buf.device}")
-
+        if buf.device.type != "cuda":
+            print(f"Buffer on CPU: {name} on {buf.device}")
 
     # return
-
 
     dataset = archie.training.get_datasets()
     text_dataset = archie.training.TextDataset(dataset, tokenizer, config)
@@ -226,107 +223,144 @@ def cmd_train(args, config, log):
 
     log.info("Starting training...")
 
-    # opt_model = torch.compile(model, mode="default")
-    opt_model = model
+    opt_model = torch.compile(model, mode="default")
+    enable_gradient_checkpointing(opt_model)
 
     running_loss = 0.0
-    for i, (x, y) in enumerate(train_loader):
-        x = x.to(config.device)
-        y = y.to(config.device)
+    accumulated_expert_counts = None
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]Step {task.fields[step]}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim]loss: {task.fields[loss]:.2f}"),
+        console=log.handlers[0].console,
+        transient=True,
+    )
 
-        tokens_seen += x.numel()
-
-        start = time.perf_counter()
-        logits, loss = opt_model(x, labels=y)
-        end = time.perf_counter()
-
-        loss = loss / accumulation_steps
-        running_loss += loss.item()
-        loss.backward()
-
-        if (i + 1) % accumulation_steps != 0:
-            continue
-
-        global_step += 1
-
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
-
-        optimizer.step()
-
-        lr = get_lr(global_step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-
-        optimizer.zero_grad()
-
-        effective_loss = running_loss
-        running_loss = 0.0
-
-        perplexity = math.exp(effective_loss)
-        tokens_M = tokens_seen / 1_000_000
-        tokens_B = tokens_M / 1_000
-        tokens_per_param = tokens_seen / total_params
-        log.info(
-            f"Step {global_step} | Tokens: {tokens_B:.4f}B ({tokens_per_param:.3f}/param)"
-            f" | PPL: {perplexity:9.2f} | loss: {effective_loss:.2f}"
-            f" | norm: {norm:.4f} | LR: {lr:.2e}"
+    with progress:
+        acc_task = progress.add_task(
+            "accumulation", total=accumulation_steps, step=global_step, loss=0.0
         )
 
-        append_log_entry(
-            {
-                "step": global_step,
-                "tokens_seen": tokens_seen,
-                "tokens_per_param": tokens_per_param,
-                "perplexity": perplexity,
-                "loss": effective_loss,
-                "norm": norm,
-                "lr": lr,
-                "datetime": datetime.utcnow().isoformat(),
-                "batch_size": batch_size,
-                "acc_steps": accumulation_steps,
-            }
-        )
+        for i, (x, y) in enumerate(train_loader):
+            x = x.to(config.device)
+            y = y.to(config.device)
 
-        if global_step % 500 == 0:
-            log.info("Running lm_eval benchmarks...")
-            run_lm_eval(
-                model,
-                tokenizer,
-                config,
-                tasks=["arc_easy", "hellaswag", "lambada_openai", "winogrande"],
-                eval_log_path=eval_log_path,
-                log=log,
-                step=global_step,
+            tokens_seen += x.numel()
+
+            start = time.perf_counter()
+            logits, loss = opt_model(x, labels=y)
+            end = time.perf_counter()
+
+            if hasattr(model, "_expert_counts"):
+                counts = model._expert_counts.detach()
+                if accumulated_expert_counts is None:
+                    accumulated_expert_counts = counts
+                else:
+                    accumulated_expert_counts = accumulated_expert_counts + counts
+
+            loss = loss / accumulation_steps
+            running_loss += loss.item()
+            loss.backward()
+
+            progress.update(acc_task, advance=1, loss=running_loss)
+
+            if (i + 1) % accumulation_steps != 0:
+                continue
+
+            global_step += 1
+
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+
+            optimizer.step()
+
+            lr = get_lr(global_step)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            optimizer.zero_grad()
+
+            if accumulated_expert_counts is not None:
+                expert_counts_list = accumulated_expert_counts.tolist()
+                with jsonlines.open(expert_usage_path, mode="a") as writer:
+                    writer.write({
+                        "step": global_step,
+                        "expert_counts": expert_counts_list,
+                        "datetime": datetime.utcnow().isoformat(),
+                    })
+                accumulated_expert_counts = None
+
+            effective_loss = running_loss
+            running_loss = 0.0
+
+            perplexity = math.exp(effective_loss)
+            tokens_M = tokens_seen / 1_000_000
+            tokens_B = tokens_M / 1_000
+            tokens_per_param = tokens_seen / total_params
+            log.info(
+                f"Step {global_step} | Tokens: {tokens_B:.4f}B ({tokens_per_param:.3f}/param)"
+                f" | PPL: {perplexity:9.2f} | loss: {effective_loss:.2f}"
+                f" | norm: {norm:.4f} | LR: {lr:.2e}"
             )
 
-        if global_step % 25 != 0:
-            continue
+            append_log_entry(
+                {
+                    "step": global_step,
+                    "tokens_seen": tokens_seen,
+                    "tokens_per_param": tokens_per_param,
+                    "perplexity": perplexity,
+                    "loss": effective_loss,
+                    "norm": norm,
+                    "lr": lr,
+                    "datetime": datetime.utcnow().isoformat(),
+                    "batch_size": batch_size,
+                    "acc_steps": accumulation_steps,
+                }
+            )
 
-        log.info("Generating samples...")
-        prompts = [
-            "The",
-            "In the",
-            "Scientists have",
-            "Once upon a time",
-            "The Capital of France is",
-            "The 2008 financial crisis was caused by",
-            "The python code to reverse a list is:\n```python\ndef reverse_list(l):",
-        ]
-        for prompt in prompts:
-            generated = generate_text(model, tokenizer, prompt=prompt, max_tokens=100)
-            log.info(f"  '{prompt}' → {generated}")
+            progress.reset(acc_task, step=global_step, loss=0.0)
 
-        log.info("Saving model...")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": global_step,
-                "tokens_seen": tokens_seen,
-            },
-            model_path,
-        )
-        log.info("Done.")
+            if global_step % 500 == 0:
+                log.info("Running lm_eval benchmarks...")
+                run_lm_eval(
+                    model,
+                    tokenizer,
+                    config,
+                    tasks=["arc_easy", "hellaswag", "lambada_openai", "winogrande"],
+                    eval_log_path=eval_log_path,
+                    log=log,
+                    step=global_step,
+                )
+
+            if global_step % 25 != 0:
+                continue
+
+            log.info("Generating samples...")
+            prompts = [
+                "The",
+                "In the",
+                "Scientists have",
+                "Once upon a time",
+                "The Capital of France is",
+                "The 2008 financial crisis was caused by",
+                "The python code to reverse a list is:\n```python\ndef reverse_list(l):",
+            ]
+            for prompt in prompts:
+                generated = generate_text(model, tokenizer, prompt=prompt, max_tokens=100)
+                log.info(f"  '{prompt}' → {generated}")
+
+            log.info("Saving model...")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": global_step,
+                    "tokens_seen": tokens_seen,
+                },
+                model_path,
+            )
+            log.info("Done.")
 
 
 def cmd_validate(args, config, log):
@@ -584,9 +618,21 @@ def cmd_upcycle(args, config, log):
 
     log.info(f"Saving MoE checkpoint to {target_path}...")
     torch.save(
-        {"model": moe_model.state_dict(), "step": 0, "tokens_seen": 0},
+        {
+            "model": moe_model.state_dict(),
+            "step": state.get("step", 0),
+            "tokens_seen": state.get("tokens_seen", 0),
+        },
         target_path,
     )
+
+    import shutil
+    source_dir = config.get_checkpoint_dir()
+    for log_file in ["training.jsonl", "evaluation.jsonl"]:
+        src = source_dir / log_file
+        if src.exists():
+            shutil.copy2(src, target_dir / log_file)
+            log.info(f"Copied {log_file} to {target_dir}")
 
     dense_params = sum(p.numel() for p in dense_sd.values())
     moe_params = sum(p.numel() for p in moe_model.parameters())
