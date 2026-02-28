@@ -140,8 +140,9 @@ def load_model_for_training(config, log):
         state = torch.load(model_path, map_location=config.device)
         log.info("Loading model...")
         model.load_state_dict(state["model"], strict=False)
-        log.info("Loading optimizer...")
-        optimizer.load_state_dict(state["optimizer"])
+        if "optimizer" in state:
+            log.info("Loading optimizer...")
+            optimizer.load_state_dict(state["optimizer"])
         global_step = state["step"]
         tokens_seen = state["tokens_seen"]
         log.info("Done.")
