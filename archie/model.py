@@ -124,6 +124,82 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class Router(nn.Module):
+    def __init__(self, d_model, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        logits = self.gate(x)  # (batch, seq_len, num_experts)
+        probs = F.softmax(logits, dim=-1)
+
+        top_k_probs, top_k_indices = torch.topk(probs, self.top_k, dim=-1)
+        # Renormalize
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        # Switch Transformer aux loss: N * sum(f_i * P_i)
+        # f_i = fraction of tokens routed to expert i
+        # P_i = mean routing probability for expert i
+        flat_indices = top_k_indices.reshape(-1, self.top_k)
+        one_hot = F.one_hot(flat_indices, self.num_experts).float()
+        tokens_per_expert = one_hot.sum(dim=0).sum(dim=0)  # (num_experts,)
+        f = tokens_per_expert / tokens_per_expert.sum()
+
+        P = probs.reshape(-1, self.num_experts).mean(dim=0)
+
+        aux_loss = self.num_experts * (f * P).sum()
+
+        return top_k_probs, top_k_indices, aux_loss
+
+
+class MoELayer(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts, top_k):
+        super().__init__()
+        self.experts = nn.ModuleList([SwiGLU(d_model, d_ff) for _ in range(num_experts)])
+        self.router = Router(d_model, num_experts, top_k)
+        self.top_k = top_k
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        top_k_probs, top_k_indices, aux_loss = self.router(x)
+        batch, seq_len, d_model = x.shape
+        output = torch.zeros_like(x)
+
+        for k in range(self.top_k):
+            indices_k = top_k_indices[..., k]  # (batch, seq_len)
+            weights_k = top_k_probs[..., k]    # (batch, seq_len)
+
+            for e_idx, expert in enumerate(self.experts):
+                mask = (indices_k == e_idx)  # (batch, seq_len)
+                if not mask.any():
+                    continue
+                tokens = x[mask]  # (num_selected, d_model)
+                expert_out = expert(tokens)
+                output[mask] += weights_k[mask].unsqueeze(-1) * expert_out
+
+        return output, aux_loss
+
+
+class MoETransformerBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = GroupedQueryAttention(
+            config.d_model, config.n_heads, config.n_kv_heads, config.max_seq_len
+        )
+        self.moe = MoELayer(config.d_model, config.d_ff, config.num_experts, config.top_k)
+        self.attn_norm = RMSNorm(config.d_model)
+        self.ffn_norm = RMSNorm(config.d_model)
+
+    def forward(self, x):
+        x = x + self.attn(self.attn_norm(x))
+        moe_out, aux_loss = self.moe(self.ffn_norm(x))
+        x = x + moe_out
+        return x, aux_loss
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -184,3 +260,57 @@ class ArchieModel(nn.Module):
             )
 
         return logits, loss
+
+
+class ArchieMoEModel(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+
+        self.config = config
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
+        self.layers = nn.ModuleList(
+            [MoETransformerBlock(config) for _ in range(config.n_layers)]
+        )
+
+        self.norm = RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Weight tying
+        self.lm_head.weight = self.embed_tokens.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_ids, labels=None):
+        x = self.embed_tokens(input_ids)
+
+        total_aux_loss = 0.0
+        for layer in self.layers:
+            x, aux_loss = layer(x)
+            total_aux_loss = total_aux_loss + aux_loss
+
+        x = self.norm(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+            loss = loss + self.config.aux_loss_weight * total_aux_loss
+
+        return logits, loss
+
+
+def create_model(config: Config):
+    if config.num_experts is not None:
+        return ArchieMoEModel(config)
+    return ArchieModel(config)

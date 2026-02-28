@@ -21,11 +21,6 @@ from rich.logging import RichHandler
 import jsonlines
 
 
-CONFIG_MAP = {
-    "flicker": archie.config.flicker,
-    "glimmer": archie.config.glimmer,
-    "blaze": archie.config.blaze,
-}
 
 
 def setup_logging(debug_log_path):
@@ -91,7 +86,10 @@ def stream_tokens(
             break
         prob = probs[0, token_id].item()
         tokens = torch.cat([tokens, next_token], dim=1)
-        yield tokenizer.decode([token_id]), prob
+        try:
+            yield tokenizer.decode([token_id]), prob
+        except:
+            pass
         if tokens.shape[1] >= model.config.max_seq_len:
             break
 
@@ -122,7 +120,7 @@ def load_model_for_training(config, log):
     checkpoint_dir = config.get_checkpoint_dir()
     model_path = checkpoint_dir / "model.pt"
 
-    model = archie.ArchieModel(config).to(config.device).to(torch.bfloat16)
+    model = archie.create_model(config).to(config.device).to(torch.bfloat16)
     enable_gradient_checkpointing(model)
     torchinfo.summary(model)
 
@@ -164,7 +162,7 @@ def load_model_for_inference(config, log):
     if not model_path.exists():
         raise FileNotFoundError(f"No checkpoint found at {model_path}")
 
-    model = archie.ArchieModel(config).to(config.device).to(torch.bfloat16)
+    model = archie.create_model(config).to(config.device).to(torch.bfloat16)
     tokenizer = archie.get_tokenizer()
 
     log.info("Loading model...")
@@ -198,9 +196,18 @@ def cmd_train(args, config, log):
     log.info(f"Accumulation steps: {accumulation_steps}")
     log.info(f"Effective batch size: {batch_size * accumulation_steps}")
 
-    seen_db_path = checkpoint_dir / "seen.db"
+    all_on_gpu = all(p.device.type == "cuda" for p in model.parameters())
+    log.info(f"Fully on GPU: {all_on_gpu}")
+    for name, buf in model.named_buffers():
+      if buf.device.type != "cuda":
+          print(f"Buffer on CPU: {name} on {buf.device}")
+
+
+    # return
+
+
     dataset = archie.training.get_datasets()
-    text_dataset = archie.training.TextDataset(dataset, tokenizer, config, db_path=str(seen_db_path))
+    text_dataset = archie.training.TextDataset(dataset, tokenizer, config)
     train_loader = DataLoader(
         text_dataset,
         batch_size=batch_size,
@@ -219,7 +226,8 @@ def cmd_train(args, config, log):
 
     log.info("Starting training...")
 
-    opt_model = torch.compile(model, mode="default")
+    # opt_model = torch.compile(model, mode="default")
+    opt_model = model
 
     running_loss = 0.0
     for i, (x, y) in enumerate(train_loader):
@@ -256,7 +264,7 @@ def cmd_train(args, config, log):
 
         perplexity = math.exp(effective_loss)
         tokens_M = tokens_seen / 1_000_000
-        tokens_B = tokens_seen / 1_000
+        tokens_B = tokens_M / 1_000
         tokens_per_param = tokens_seen / total_params
         log.info(
             f"Step {global_step} | Tokens: {tokens_B:.4f}B ({tokens_per_param:.3f}/param)"
@@ -529,6 +537,65 @@ def run_lm_eval(model, tokenizer, config, tasks, eval_log_path, log, step=None):
     return results
 
 
+def cmd_upcycle(args, config, log):
+    target_config = archie.config.load(args.target)
+    if target_config.num_experts is None:
+        raise ValueError(f"Target config {args.target!r} is not an MoE config")
+
+    source_path = config.get_checkpoint_dir() / "model.pt"
+    if not source_path.exists():
+        raise FileNotFoundError(f"No dense checkpoint at {source_path}")
+
+    log.info(f"Loading dense checkpoint from {source_path}...")
+    state = torch.load(source_path, map_location="cpu")
+    dense_sd = state["model"]
+
+    log.info(f"Creating MoE model with config {args.target!r}...")
+    moe_model = archie.create_model(target_config)
+    moe_sd = moe_model.state_dict()
+
+    new_sd = {}
+    for key in moe_sd:
+        if ".moe.experts." in key:
+            # Map layers.{i}.moe.experts.{j}.{param} -> layers.{i}.ffn.{param}
+            parts = key.split(".")
+            layer_idx = parts[1]
+            param_parts = parts[5:]  # after "experts.{j}"
+            dense_key = f"layers.{layer_idx}.ffn.{'.'.join(param_parts)}"
+            if dense_key in dense_sd:
+                new_sd[key] = dense_sd[dense_key].clone()
+                continue
+            log.warning(f"No dense key for {key} (expected {dense_key})")
+            new_sd[key] = moe_sd[key]
+        elif ".moe.router." in key:
+            # Keep random init
+            new_sd[key] = moe_sd[key]
+        elif key in dense_sd:
+            new_sd[key] = dense_sd[key]
+        else:
+            log.warning(f"Key {key} not found in dense checkpoint, using random init")
+            new_sd[key] = moe_sd[key]
+
+    moe_model.load_state_dict(new_sd)
+
+    target_dir = target_config.get_checkpoint_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / "model.pt"
+
+    log.info(f"Saving MoE checkpoint to {target_path}...")
+    torch.save(
+        {"model": moe_model.state_dict(), "step": 0, "tokens_seen": 0},
+        target_path,
+    )
+
+    dense_params = sum(p.numel() for p in dense_sd.values())
+    moe_params = sum(p.numel() for p in moe_model.parameters())
+    log.info(
+        f"Upcycled {dense_params/1e6:.1f}M dense -> {moe_params/1e6:.1f}M MoE "
+        f"({target_config.num_experts} experts, top-{target_config.top_k})"
+    )
+
+
 def cmd_evaluate(args, config, log):
     import json
 
@@ -551,7 +618,7 @@ def main():
     parser = argparse.ArgumentParser(description="Archie language model")
     parser.add_argument(
         "--model",
-        choices=list(CONFIG_MAP.keys()),
+        choices=archie.config.list_configs(),
         default="flicker",
         help="Model configuration to use (default: flicker)",
     )
@@ -571,6 +638,16 @@ def main():
     )
 
     subparsers.add_parser("test", help="Interactive next-token prediction (input loop)")
+
+    upcycle_parser = subparsers.add_parser(
+        "upcycle", help="Convert dense checkpoint to MoE"
+    )
+    upcycle_parser.add_argument(
+        "--target",
+        required=True,
+        choices=archie.config.list_configs(),
+        help="Target MoE config name",
+    )
 
     eval_parser = subparsers.add_parser("evaluate", help="Run lm_eval benchmarks")
     eval_parser.add_argument(
@@ -592,7 +669,7 @@ def main():
 
     args = parser.parse_args()
 
-    config = CONFIG_MAP[args.model]
+    config = archie.config.load(args.model)
     checkpoint_dir = config.get_checkpoint_dir()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     debug_log_path = checkpoint_dir / "archie.log"
@@ -604,6 +681,7 @@ def main():
         "validate": cmd_validate,
         "test": cmd_test,
         "evaluate": cmd_evaluate,
+        "upcycle": cmd_upcycle,
     }
     dispatch[args.command](args, config, log)
 

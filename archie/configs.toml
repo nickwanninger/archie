@@ -1,0 +1,25 @@
+[model.flicker200m]
+d_model = 640
+n_layers = 25
+n_heads = 8
+n_kv_heads = 4
+d_ff = 2048
+max_seq_len = 1024
+
+[model.flicker]
+d_model = 1024
+n_layers = 24
+n_heads = 24
+n_kv_heads = 4
+d_ff = 6144
+max_seq_len = 4096
+
+[model.flicker4xMoE]
+d_model = 1024
+n_layers = 24
+n_heads = 24
+n_kv_heads = 4
+d_ff = 6144
+max_seq_len = 4096
+num_experts = 4
+top_k = 2

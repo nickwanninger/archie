@@ -1,5 +1,8 @@
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+_CONFIGS_PATH = Path(__file__).parent / "configs.toml"
 
 
 @dataclass
@@ -15,10 +18,14 @@ class Config:
     n_heads: int = 16
     n_kv_heads: int = 4
 
-    d_ff: int = 5504  # ??
+    d_ff: int = 5504
 
     max_seq_len: int = 2048
     dropout: float = 0.0
+
+    num_experts: int | None = None
+    top_k: int = 2
+    aux_loss_weight: float = 0.01
 
     def to_name(self):
         return f"{self.dim}d_{self.n_layers}l_{self.n_heads}h_{self.n_kv_heads}kv"
@@ -27,40 +34,17 @@ class Config:
         return Path("models") / Path(self.name)
 
 
-# Smaller model.
-flicker = Config(
-    name="flicker",
-    d_model=1024,
-    n_layers=24,
-    n_heads=24,
-    n_kv_heads=4,
-    d_ff=6144,
-    # max_seq_len=1024,
-    max_seq_len=4096,
-    dropout=0.0,
-)
+def _load_all() -> dict[str, dict]:
+    with open(_CONFIGS_PATH, "rb") as f:
+        return tomllib.load(f).get("model", {})
 
-# Medium 1.2b config.
-glimmer = Config(
-    name="glimmer",
-    d_model=2048,
-    n_layers=24,
-    n_heads=16,
-    n_kv_heads=4,
-    d_ff=5504,
-    max_seq_len=2048,
-    dropout=0.0,
-)
 
-# Larger 7b config.
-blaze = Config(
-    name="blaze",
-    d_model=4096,
-    n_layers=32,
-    n_heads=32,
-    n_kv_heads=8,
-    d_ff=11008,
-    # Should we grow this?
-    max_seq_len=2048,
-    dropout=0.0,
-)
+def load(name: str) -> Config:
+    models = _load_all()
+    if name not in models:
+        raise ValueError(f"Unknown config: {name!r}. Available: {list(models)}")
+    return Config(name=name, **models[name])
+
+
+def list_configs() -> list[str]:
+    return list(_load_all().keys())

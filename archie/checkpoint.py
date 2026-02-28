@@ -1,13 +1,13 @@
 import torch
 
 
-from archie.model import ArchieModel
+from archie.model import ArchieModel, ArchieMoEModel, create_model
 from archie.config import Config
 from archie.tokenizer import get_tokenizer
 
 
-def load_model_from_checkpoint(config: Config, path=None) -> ArchieModel:
-    model = ArchieModel(config).to(config.device).to(torch.bfloat16)
+def load_model_from_checkpoint(config: Config, path=None):
+    model = create_model(config).to(config.device).to(torch.bfloat16)
     tokenizer = get_tokenizer()
 
     if path is None:
