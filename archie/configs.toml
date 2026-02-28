@@ -23,3 +23,4 @@ d_ff = 6144
 max_seq_len = 4096
 num_experts = 4
 top_k = 2
+training_batch_size = 3

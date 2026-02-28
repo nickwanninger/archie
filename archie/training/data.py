@@ -10,33 +10,56 @@ from itertools import cycle
 from datasets import load_dataset
 
 
+def init_seen_db(db_path):
+    """Create the seen-documents database and table. Call once from the main process."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS seen (uuid TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+
 class SeenDB:
     """Tracks seen document UUIDs in a SQLite database to avoid training on duplicates."""
+
+    BATCH_SIZE = 256
 
     def __init__(self, db_path):
         self.db_path = db_path
         self.conn = None
+        self.pending = []
 
     def _ensure_conn(self):
         if self.conn is not None:
             return
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("CREATE TABLE IF NOT EXISTS seen (uuid TEXT PRIMARY KEY)")
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
+
+    def _flush(self):
+        if not self.pending:
+            return
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO seen (uuid) VALUES (?)",
+            [(u,) for u in self.pending],
+        )
         self.conn.commit()
+        self.pending.clear()
 
     def check_and_add(self, uuid):
-        """Returns True if the UUID was already seen, False if it's new (and inserts it)."""
+        """Returns True if the UUID was already seen, False if it's new (and queues it for insert)."""
         self._ensure_conn()
-        try:
-            self.conn.execute("INSERT INTO seen (uuid) VALUES (?)", (uuid,))
-            self.conn.commit()
-            return False
-        except sqlite3.IntegrityError:
+        row = self.conn.execute(
+            "SELECT 1 FROM seen WHERE uuid = ?", (uuid,)
+        ).fetchone()
+        if row:
             return True
+        self.pending.append(uuid)
+        if len(self.pending) >= self.BATCH_SIZE:
+            self._flush()
+        return False
 
     def close(self):
         if self.conn:
+            self._flush()
             self.conn.close()
             self.conn = None
 
@@ -90,8 +113,6 @@ class TextDataset(IterableDataset):
                 index=worker_info.id,
             )
 
-        seen_db = SeenDB(self.db_path) if self.db_path else None
-
         # Buffer to accumulate tokens across documents
         token_buffer = []
         offset = 0
@@ -99,9 +120,6 @@ class TextDataset(IterableDataset):
         trim_every = 100_000  # amortize the list copy cost
 
         for example in dataset:
-            if seen_db and seen_db.check_and_add(example["uuid"]):
-                continue
-
             text = example["text"]
             text = text.replace("\r\n", "\n").replace(
                 "\r", "\n"
