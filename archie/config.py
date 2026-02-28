@@ -27,6 +27,9 @@ class Config:
     top_k: int = 2
     aux_loss_weight: float = 0.01
 
+    training_batch_size: int = 8
+    training_tokens_per_batch: int = 500_000
+
     def to_name(self):
         return f"{self.dim}d_{self.n_layers}l_{self.n_heads}h_{self.n_kv_heads}kv"
 

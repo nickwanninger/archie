@@ -187,9 +187,8 @@ def cmd_train(args, config, log):
     model, optimizer, global_step, tokens_seen = load_model_for_training(config, log)
     tokenizer = archie.get_tokenizer()
 
-    desired_tokens_per_batch = 0.5e6
-    desired_batch_size = desired_tokens_per_batch // config.max_seq_len
-    batch_size = 8
+    batch_size = config.training_batch_size
+    desired_batch_size = config.training_tokens_per_batch // config.max_seq_len
     accumulation_steps = int(desired_batch_size // batch_size)
 
     log.info(f"Batch size: {batch_size}")
